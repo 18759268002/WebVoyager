@@ -403,3 +403,25 @@ def get_pdf_retrieval_ans_from_assistant(client, pdf_path, task):
     # print(assistant_deletion_status)
     logging.info(assistant_deletion_status)
     return messages_text
+
+def extract_thoughts_and_system_messages(messages):
+    extracted_messages = []
+
+    for message in messages:
+        if message['role'] == 'system':
+            extracted_messages.append(message)
+        elif message['role'] == 'assistant' and 'Thought' in message['content']:
+            extracted_messages.append({
+                'role': 'assistant',
+                'content': message['content']
+            })
+        elif message['role'] == 'user' and isinstance(message['content'], list):
+            
+            extracted_messages.append(
+                {
+                    'role': 'user',
+                    'content': message['content'][0]['text']
+                }
+            )
+
+    return extracted_messages

@@ -76,3 +76,16 @@ Action: {One Action format you choose}
 
 Then the User will provide:
 Observation: {Accessibility Tree of a web page}"""
+
+REFLECTION_PROMPT = """These images are two phone screenshots before and after an operation. 
+### Response requirements ###
+Now you need to output the following content based on the screenshots before and after the current operation:\n"
+Whether the result of the \"Previous Operation action\" meets your expectation of \"Previous Operation thought\"?
+A: The result of the \"Previous Operation action\" meets my expectation of \"Operation thought\".
+B: The \"Previous Operation action\" results in a wrong page and I need to return to the previous page.\n"
+C: The \"Previous Operation action\" produces no changes.
+
+### Output format ###
+Your output format is:
+### Thought ###\nYour thought about the question\n
+### Answer ###\nA or B or C"""

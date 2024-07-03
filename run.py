@@ -6,17 +6,24 @@ import re
 import os
 import shutil
 import logging
+import glob
+
+from dotenv import load_dotenv
+
+_=load_dotenv()
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.chrome.service import Service
 
 from prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY
 from openai import OpenAI
 from utils import get_web_element_rect, encode_image, extract_information, print_message,\
-    get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
+    get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs,clip_message_and_obs_text_only
 
+from utils import extract_thoughts_and_system_messages
 
 def setup_logger(folder_path):
     log_file_path = os.path.join(folder_path, 'agent.log')
@@ -52,10 +59,23 @@ def driver_config(args):
             "plugins.always_open_pdf_externally": True
         }
     )
+    
+    options.add_argument('--ignore-certificate-errors')  # 忽略证书错误
+    options.add_argument('--ignore-ssl-errors')  # 忽略SSL错误
+    options.add_argument("--disable-notifications")  # 禁用通知
+    options.add_argument("disable-infobars")  # 禁用信息栏
+    options.add_argument("--disable-extensions")  # 禁用扩展
+    prefs = {
+    "credentials_enable_service": False,
+    "profile.password_manager_enabled": False
+    }
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.121 Safari/537.36")  # 设置用户代理
+    options.add_experimental_option("prefs", prefs)  # 设置偏好项
+    options.add_experimental_option("useAutomationExtension", False)  # 禁用自动化扩展
     return options
 
 
-def format_msg(it, init_msg, pdf_obs, warn_obs, web_img_b64, web_text):
+def format_msg(it, init_msg, pdf_obs, warn_obs, web_img_b64, web_text, args,action_obs):
     if it == 1:
         init_msg += f"I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"
         init_msg_format = {
@@ -90,10 +110,18 @@ def format_msg(it, init_msg, pdf_obs, warn_obs, web_img_b64, web_text):
                     }
                 ]
             }
+            
+        if args.refelction_mode == "B":
+            curr_msg.append({"type": 'text', 'text':f"the {action_obs[it]} results in a wrong page and I need to return to the previous page."})
+
+        elif args.refelction_mode == "C":    
+            curr_msg.append({"type": 'text', 'text':f"The {action_obs[it]} produces no changes."})
+        
         return curr_msg
 
 
-def format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree):
+def format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree, args,action_obs):
+
     if it == 1:
         init_msg_format = {
             'role': 'user',
@@ -111,6 +139,13 @@ def format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree):
                 'role': 'user',
                 'content': f"Observation: {pdf_obs} Please analyze the response given by Assistant, then consider whether to continue iterating or not. The accessibility tree of the current page is also given, give the Thought and Action.\n{ac_tree}"
             }
+            
+        if args.reflection_mode == "B":
+            curr_msg.append({"type": 'text', 'text':f"the {action_obs[it]} results in a wrong page and I need to return to the previous page."})
+
+        elif args.reflection_mode == "C":    
+            curr_msg.append({"type": 'text', 'text':f"The {action_obs[it]} produces no changes."})
+
         return curr_msg
 
 
@@ -161,6 +196,18 @@ def call_gpt4v_api(args, openai_client, messages):
 
 
 def exec_action_click(info, web_ele, driver_task):
+    """
+    模拟用户点击网页元素
+
+    参数:
+        info (dict): 元素的相关信息，目前没有被使用，可能在函数的其他地方使用。
+        web_ele (WebElement): 要点击的网页元素。
+        driver_task (WebDriver): 用于控制浏览器的驱动对象。
+
+    返回:
+        None
+    """
+    #通用方法
     driver_task.execute_script("arguments[0].setAttribute('target', '_self')", web_ele)
     web_ele.click()
     time.sleep(3)
@@ -180,19 +227,20 @@ def exec_action_type(info, web_ele, driver_task):
         web_ele.clear()
         # Another way to delete
         if platform.system() == 'Darwin':
-            web_ele.send_keys(Keys.COMMAND + "a")
+            web_ele.send_keys(Keys.COMMAND + "a")#全选后删除
         else:
             web_ele.send_keys(Keys.CONTROL + "a")
+            
         web_ele.send_keys(" ")
         web_ele.send_keys(Keys.BACKSPACE)
     except:
         pass
 
-    actions = ActionChains(driver_task)
+    actions = ActionChains(driver_task)#ActionChains是Selenium中的一个类，用于创建一系列的用户操作（如点击、输入、拖动等）。
     actions.click(web_ele).perform()
     actions.pause(1)
 
-    try:
+    try:#放置按下空格导致的默认动作
         driver_task.execute_script("""window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea' && e.target.type != 'search') {e.preventDefault();}};""")
     except:
         pass
@@ -232,17 +280,33 @@ def exec_action_scroll(info, web_eles, driver_task, args, obs_info):
 
 
 def main():
+    REFLECTION_PROMPT = """These images are two phone screenshots before and after an operation. 
+### Response requirements ###
+Now you need to output the following content based on the screenshots before and after the current operation:\n"
+Whether the result of the \"Previous Operation action\" meets your expectation of \"Previous Operation thought\"?
+A: The result of the \"Previous Operation action\" meets my expectation of \"Operation thought\".
+B: The \"Previous Operation action\" results in a wrong page and I need to return to the previous page.\n"
+C: The \"Previous Operation action\" produces no changes.
+
+### Output format ###
+Your output format is:
+### Thought ###\nYour thought about the question\n
+### Answer ###\nA or B or C"""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test_file', type=str, default='data/test.json')
-    parser.add_argument('--max_iter', type=int, default=5)
-    parser.add_argument("--api_key", default="key", type=str, help="YOUR_OPENAI_API_KEY")
-    parser.add_argument("--api_model", default="gpt-4-vision-preview", type=str, help="api model name")
+    parser.add_argument('--test_file', type=str, default='data/GAIA_web.jsonl')
+    parser.add_argument('--max_iter', type=int, default=10)
+    parser.add_argument("--api_key", default="openai_api_key", type=str, help="API key")
+    parser.add_argument("--api_model", default="gpt-4o", type=str, help="gpt-4o")
     parser.add_argument("--output_dir", type=str, default='results')
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max_attached_imgs", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--download_dir", type=str, default="downloads")
     parser.add_argument("--text_only", action='store_true')
+    parser.add_argument("--refelction_mode",type=bool,default=True)
+    parser.add_argument("--reflection_state",type=str,default="none")
+
+
     # for web browser
     parser.add_argument("--headless", action='store_true', help='The window of selenium')
     parser.add_argument("--save_accessibility_tree", action='store_true')
@@ -252,9 +316,17 @@ def main():
     parser.add_argument("--fix_box_color", action='store_true')
 
     args = parser.parse_args()
+    
+    step_api_client = os.getenv('STEP_API_CLIENT')
+    siclion_cloud_api_key = os.getenv('SICLION_CLOUD_API_KEY')
+    alibaba_api_key=os.getenv('ALIBABA_API_KEY')
+
 
     # OpenAI client
     client = OpenAI(api_key=args.api_key)
+    client2 = OpenAI(api_key="step_api_client", base_url="https://api.stepfun.com/v1")
+    client3 = OpenAI(api_key="alibaba_api_key", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    client4 = OpenAI(api_key="siclion_cloud_api_key", base_url="https://api.siliconflow.cn/v1")
 
     options = driver_config(args)
 
@@ -263,11 +335,18 @@ def main():
     result_dir = os.path.join(args.output_dir, current_time)
     os.makedirs(result_dir, exist_ok=True)
 
-    # Load tasks
     tasks = []
+    start_task_id = "7a4a336d-dcfa-45a0-b014-824c7619e8de"  # 指定开始任务的ID
+    load_tasks = False
+
     with open(args.test_file, 'r', encoding='utf-8') as f:
         for line in f:
-            tasks.append(json.loads(line))
+            task = json.loads(line)
+            if task["task_id"] == start_task_id:
+                load_tasks = True  # 找到指定任务ID时开始加载任务
+            if load_tasks:
+                tasks.append(task)
+
 
 
     for task_id in range(len(tasks)):
@@ -276,7 +355,6 @@ def main():
         os.makedirs(task_dir, exist_ok=True)
         setup_logger(task_dir)
         logging.info(f'########## TASK{task["id"]} ##########')
-
         driver_task = webdriver.Chrome(options=options)
 
         # About window size, 765 tokens
@@ -298,6 +376,8 @@ def main():
                 os.remove(file_path)
 
         download_files = []  # sorted(os.listdir(args.download_dir))
+        action_obs = [[100] for _ in range(args.max_iter)]
+
 
         fail_obs = ""  # When error execute the action
         pdf_obs = ""  # When download PDF file
@@ -337,8 +417,8 @@ def main():
                     logging.error(e)
                     break
 
-                img_path = os.path.join(task_dir, 'screenshot{}.png'.format(it))
-                driver_task.save_screenshot(img_path)
+                img_path = os.path.join(task_dir, 'screenshot{}.png'.format(it))#join是用来拼接的,不是用来保存的
+                driver_task.save_screenshot(img_path)#自带的
 
                 # accessibility tree
                 if (not args.text_only) and args.save_accessibility_tree:
@@ -346,15 +426,81 @@ def main():
                     get_webarena_accessibility_tree(driver_task, accessibility_tree_path)
 
                 # encode image
-                b64_img = encode_image(img_path)
+                b64_img = encode_image(img_path)#base64编码,可以不用把图片传到服务器
 
+                # add refelction node 
+                # function : if it > 2 , when previous action made no changes or made changes we do not want to see 
+                # we ask agent to rethink based on it 
+                # args : image_path , refelction prompt "added to system message"
+                # if the outcome is what we want to see , delete the message made in this turn
+                # so temp message needed to store the current ones
+                
+                if args.refelction_mode and it > 1:
+                    file_pattern = os.path.join(task_dir, 'screenshot{}.png'.format(it-1))
+                    matching_files = glob.glob(file_pattern) 
+                    b64_img_prev = encode_image(matching_files[0]) 
+                    obs_prompt = "Observation: please analyze the attached screenshot and give the Thought and Action."
+                    REFLECTION_PROMPT = REFLECTION_PROMPT.replace("Previous Operation action", action_obs[it-1])
+                    reflection_prompt = REFLECTION_PROMPT
+                    messages.append({'role': 'system', 'content': reflection_prompt})
+                    # messages.append({'role': 'user', 'content': b64_img})
+                    # messages.append({'role': 'user', 'content': b64_img_prev})
+                    print(messages)
+                    try:
+                        response_openai = client2.chat.completions.create(
+                            model='step-1v-8k',
+                            messages=messages,
+                        )
+                        response=response_openai.choices[0].message.content
+                        # print(1111111111111111111111111111)
+                        # print(response_openai)
+                    except Exception as e:
+                        logging.info(f'Error occurred, retrying. Error type: {type(e).__name__}')
+
+                        if type(e).__name__ == 'RateLimitError':
+                            time.sleep(10)
+
+                        elif type(e).__name__ == 'APIError':
+                            time.sleep(15)
+
+                        elif type(e).__name__ == 'InvalidRequestError':
+                            gpt_call_error = True
+
+                        else:
+                            gpt_call_error = True
+                    
+                    if gpt_call_error:
+                        break
+                    else:
+                        # accumulate_prompt_token += prompt_tokens
+                        # accumulate_completion_token += completion_tokens
+                        # logging.info(f'Accumulate Prompt Tokens: {accumulate_prompt_token}; Accumulate Completion Tokens: {accumulate_completion_token}')
+                        logging.info('API call complete...')
+                    # extract answer form response
+                    if "A" in response: #suit
+                        args.refelction_state="A"
+                        messages.pop()  
+                        messages.pop() 
+                        messages.pop()  
+                        
+                    elif "B" in response: #wrong and need to return
+                        args.refelction_state="B"
+
+                        
+                    elif "C" in response: #no difference made
+                        args.refelction_state="C"
+                
                 # format msg
                 if not args.text_only:
-                    curr_msg = format_msg(it, init_msg, pdf_obs, warn_obs, b64_img, web_eles_text)
+                    curr_msg = format_msg(it, init_msg, pdf_obs, warn_obs, b64_img, web_eles_text, args,action_obs)
+                    
+                    
                 else:
-                    curr_msg = format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree)
+                    curr_msg = format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree, args,action_obs)
                 messages.append(curr_msg)
-            else:
+                
+                
+            else:#循环中的错误处理,这样来看,我的reflection-mode好像没啥用
                 curr_msg = {
                     'role': 'user',
                     'content': fail_obs
@@ -366,7 +512,9 @@ def main():
                 messages = clip_message_and_obs(messages, args.max_attached_imgs)
             else:
                 messages = clip_message_and_obs_text_only(messages, args.max_attached_imgs)
-
+                
+            #可以在这里加一个记录功能,只保留思考过程和系统提示词
+            messages=extract_thoughts_and_system_messages(messages)
             # Call GPT-4v API
             prompt_tokens, completion_tokens, gpt_call_error, openai_response = call_gpt4v_api(args, client, messages)
 
@@ -400,6 +548,7 @@ def main():
 
             # bot_thought = re.split(pattern, gpt_4v_res)[1].strip()
             chosen_action = re.split(pattern, gpt_4v_res)[2].strip()
+            action_obs[it] = chosen_action 
             # print(chosen_action)
             action_key, info = extract_information(chosen_action)
 
@@ -409,7 +558,7 @@ def main():
             # execute action
             try:
                 window_handle_task = driver_task.current_window_handle
-                driver_task.switch_to.window(window_handle_task)
+                driver_task.switch_to.window(window_handle_task)#用于多个窗口间切换
 
                 if action_key == 'click':
                     if not args.text_only:
@@ -423,7 +572,7 @@ def main():
                         web_ele = driver_task.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
 
                     ele_tag_name = web_ele.tag_name.lower()
-                    ele_type = web_ele.get_attribute("type")
+                    ele_type = web_ele.get_attribute("type")#用于判断是什么类型的标签
 
                     exec_action_click(info, web_ele, driver_task)
 
@@ -442,7 +591,7 @@ def main():
                             pdf_obs = "You downloaded a PDF file, I ask the Assistant API to answer the task based on the PDF file and get the following response: " + pdf_obs
                         download_files = current_files
 
-                    if ele_tag_name == 'button' and ele_type == 'submit':
+                    if ele_tag_name == 'button' and ele_type == 'submit':#按下的按钮的种类
                         time.sleep(10)
 
                 elif action_key == 'wait':
@@ -450,7 +599,7 @@ def main():
 
                 elif action_key == 'type':
                     if not args.text_only:
-                        type_ele_number = int(info['number'])
+                        type_ele_number = int(info['number'])#在extractinformation定义的,好方法!
                         web_ele = web_eles[type_ele_number]
                     else:
                         type_ele_number = info['number']
@@ -474,7 +623,7 @@ def main():
                     time.sleep(2)
 
                 elif action_key == 'google':
-                    driver_task.get('https://www.google.com/')
+                    driver_task.get('https://www.google.com/')#导航到这个窗口不会打开新的,估计是为了减少代码量的偷懒操作
                     time.sleep(2)
 
                 elif action_key == 'answer':
@@ -493,6 +642,8 @@ def main():
                 else:
                     fail_obs = ""
                 time.sleep(2)
+                
+            
 
         print_message(messages, task_dir)
         driver_task.quit()
